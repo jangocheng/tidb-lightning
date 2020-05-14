@@ -389,6 +389,7 @@ func (cfg *Config) Adjust() error {
 		}
 		mustHaveInternalConnections = false
 	case BackendImporter:
+	case BackendTiKV:
 		if cfg.App.IndexConcurrency == 0 {
 			cfg.App.IndexConcurrency = 2
 		}
