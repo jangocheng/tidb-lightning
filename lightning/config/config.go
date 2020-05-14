@@ -44,6 +44,8 @@ const (
 	BackendTiDB = "tidb"
 	// BackendImporter is a constant for choosing the "Importer" backend in the configuration.
 	BackendImporter = "importer"
+	// BackendTiKV is a constant for choosing the "TiKV" backend in the configuration
+	BackendTiKV = "tikv"
 
 	// CheckpointDriverMySQL is a constant for choosing the "MySQL" checkpoint driver in the configuration.
 	CheckpointDriverMySQL = "mysql"
