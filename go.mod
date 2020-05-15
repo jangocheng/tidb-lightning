@@ -28,3 +28,5 @@ require (
 	google.golang.org/grpc v1.25.1
 	modernc.org/mathutil v1.0.0
 )
+
+replace github.com/pingcap/tidb => github.com/glorv/tidb v1.1.0-beta.0.20200515014903-ff2771ddbbad
