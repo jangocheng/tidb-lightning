@@ -49,6 +49,8 @@ import (
 const (
 	dialTimeout             = 5 * time.Second
 	defaultRangeConcurrency = 32
+	engineSampleSize  = 2 << 17
+	batchSampleSize = 2 << 10
 )
 
 // Range record start and end key for localFile.DB
@@ -69,6 +71,10 @@ type localFile struct {
 	ranges   []Range
 	startKey []byte
 	endKey   []byte
+
+	sampleChan chan *SampleBuilder
+	sampleBuilder *SampleBuilder
+	sampleWg sync.WaitGroup
 }
 
 func (e *localFile) Close() error {
@@ -209,7 +215,21 @@ func (local *local) OpenEngine(ctx context.Context, engineUUID uuid.UUID) error 
 	if err != nil {
 		return err
 	}
-	local.engines.Store(engineUUID, &localFile{db: db, length: 0, ranges: make([]Range, 0)})
+	lf := &localFile{
+		db: db,
+		length: 0,
+		ranges: make([]Range, 0),
+		sampleChan: make(chan *SampleBuilder, 128),
+		sampleBuilder: NewSampleBuilder(engineSampleSize),
+	}
+	local.engines.Store(engineUUID, lf)
+	lf.sampleWg.Add(1)
+	go func() {
+			defer lf.sampleWg.Done()
+			for b := range lf.sampleChan {
+				lf.sampleBuilder.Merge(b)
+			}
+	}()
 	return nil
 }
 
@@ -220,8 +240,10 @@ func (local *local) CloseEngine(ctx context.Context, engineUUID uuid.UUID) error
 	if !ok {
 		return errors.Errorf("could not find engine %s in CloseEngine", engineUUID.String())
 	}
-	db := engineFile.(*localFile).db
-	return db.Flush()
+	lf := engineFile.(*localFile)
+	close(lf.sampleChan)
+	lf.sampleWg.Wait()
+	return lf.db.Flush()
 }
 
 func (local *local) getImportClient(ctx context.Context, peer *metapb.Peer) (sst.ImportSSTClient, error) {
@@ -433,6 +455,8 @@ func (local *local) ReadAndSplitIntoRange(engineFile *localFile, engineUUID uuid
 
 	// split data into n ranges, then seek n times to get n + 1 ranges
 	n := engineFile.totalSize / local.regionSplitSize
+	hg := engineFile.sampleBuilder.Build(int(n))
+	engineFile.sampleBuilder = nil
 
 	if tablecodec.IsIndexKey(startKey) {
 		// index engine
@@ -488,7 +512,8 @@ func (local *local) ReadAndSplitIntoRange(engineFile *localFile, engineUUID uuid
 				zap.Int64("indexID", i), zap.Int64("rangeCount", indexRangeCount),
 				zap.Binary("start", startKeyOfIndex), zap.Binary("end", lastKeyOfIndex))
 
-			values := splitValuesToRange(startValues, endValues, indexRangeCount)
+
+			values := splitValuesToRange(startValues, endValues, indexRangeCount, hg)
 
 			keyPrefix := tablecodec.EncodeTableIndexPrefix(tableID, i)
 			for _, v := range values {
@@ -508,29 +533,31 @@ func (local *local) ReadAndSplitIntoRange(engineFile *localFile, engineUUID uuid
 			return nil, err
 		}
 		step := (endHandle - startHandle) / n
-		index := int64(0)
+		index := 0
 		var skey, ekey []byte
+		startBytes := make([]byte, 8)
+		binary.BigEndian.PutUint64(startBytes, uint64(startHandle))
+		endBytes := make([]byte, 8)
+		binary.BigEndian.PutUint64(endBytes, uint64(endHandle))
+		values := splitValuesToRange(startBytes, endBytes, n, hg)
 
 		log.L().Info("data engine", zap.Int64("step", step),
 			zap.Int64("startHandle", startHandle), zap.Int64("endHandle", endHandle))
 
-		for i := startHandle; i+step <= endHandle; i += step {
-			skey = tablecodec.EncodeRowKeyWithHandle(tableID, i)
-			ekey = tablecodec.EncodeRowKeyWithHandle(tableID, i+step-1)
+		start := startHandle
+		for i, endBytes := range values {
+			end := int64(binary.BigEndian.Uint64(endBytes))
+			skey = tablecodec.EncodeRowKeyWithHandle(tableID, start)
+			ekey = tablecodec.EncodeRowKeyWithHandle(tableID, end)
 			index = i
-			log.L().Debug("data engine append range", zap.Int64("start handle", i),
-				zap.Int64("end handle", i+step-1), zap.Binary("start key", skey),
+			log.L().Debug("data engine append range", zap.Int("ordinal", index),
+				zap.Int64("start handle", start),
+				zap.Int64("end handle", end), zap.Binary("start key", skey),
 				zap.Binary("end key", ekey), zap.Int64("step", step))
 
 			ranges = append(ranges, Range{start: skey, end: nextKey(ekey)})
+			start = end + 1
 		}
-		log.L().Debug("data engine append range at final",
-			zap.Int64("start handle", index+step), zap.Int64("end handle", endHandle),
-			zap.Binary("start key", skey), zap.Binary("end key", endKey),
-			zap.Int64("step", endHandle-index-step+1))
-
-		skey = tablecodec.EncodeRowKeyWithHandle(tableID, index+step)
-		ranges = append(ranges, Range{start: skey, end: nextKey(endKey)})
 	}
 	return ranges, nil
 }
@@ -788,6 +815,26 @@ func (local *local) WriteRows(
 	}
 	engineFile := e.(*localFile)
 
+	sb := NewSampleBuilder(batchSampleSize)
+ 	var extractFunc func(b []byte) uint64
+	if tablecodec.IsIndexKey(kvs[0].Key) {
+		extractFunc = func(b []byte) uint64 {
+			valueBytes := b[tablecodec.RecordRowKeyLen:]
+			if len(valueBytes) >= 8 {
+				return binary.BigEndian.Uint64(valueBytes[:8])
+			} else {
+				buf := make([]byte, 0, 8)
+				copy(buf, valueBytes)
+				return binary.BigEndian.Uint64(buf)
+			}
+		}
+	} else {
+		extractFunc = func(b []byte) uint64 {
+			h, _ := tablecodec.DecodeRowKey(b)
+			return uint64(h)
+		}
+	}
+
 	// write to go leveldb get get sorted kv
 	wb := engineFile.db.NewBatch()
 	defer wb.Close()
@@ -797,6 +844,7 @@ func (local *local) WriteRows(
 	for _, pair := range kvs {
 		wb.Set(pair.Key, pair.Val, wo)
 		size += int64(len(pair.Key) + len(pair.Val))
+		sb.Add(extractFunc(pair.Key))
 	}
 	err := wb.Commit(wo)
 	if err != nil {
@@ -805,6 +853,7 @@ func (local *local) WriteRows(
 	engineFile.length += int64(len(kvs))
 	engineFile.totalSize += size
 	engineFile.ts = ts
+	engineFile.sampleChan <- sb
 	local.engines.Store(engineUUID, engineFile)
 	return
 }
@@ -882,7 +931,7 @@ func nextKey(key []byte) []byte {
 // splitValuesToRange try to cut [start, end] to count range approximately
 // just like [start, v1], [v1, v2]... [vCount, end]
 // return value []{v1, v2... vCount}
-func splitValuesToRange(start []byte, end []byte, count int64) [][]byte {
+func splitValuesToRange(start []byte, end []byte, count int64, hg *Histogram) [][]byte {
 	if bytes.Compare(start, end) == 0 {
 		log.L().Info("couldn't split range due to start end are same",
 			zap.Binary("start", start),
@@ -890,9 +939,6 @@ func splitValuesToRange(start []byte, end []byte, count int64) [][]byte {
 			zap.Int64("count", count))
 		return [][]byte{end}
 	}
-
-	startBytes := make([]byte, 8)
-	endBytes := make([]byte, 8)
 
 	minLen := len(start)
 	if minLen > len(end) {
@@ -907,25 +953,91 @@ func splitValuesToRange(start []byte, end []byte, count int64) [][]byte {
 		}
 	}
 
-	copy(startBytes, start[offset:])
-	copy(endBytes, end[offset:])
-
+	startBytes := make([]byte, 8)
+	endBytes := make([]byte, 8)
+	copy(startBytes, start)
+	copy(endBytes, end)
 	sValue := binary.BigEndian.Uint64(startBytes)
 	eValue := binary.BigEndian.Uint64(endBytes)
 
-	step := (eValue - sValue) / uint64(count)
-	if step == uint64(0) {
-		step = uint64(1)
+	buckets := hg.buckets
+	s := -1
+	e := -1
+	for i := 0; i < len(buckets); i++ {
+		if hg.buckets[i].upper >= sValue {
+			s = i
+			break
+		}
+	}
+	for i := len(buckets)-1; i >= 0; i-- {
+		if buckets[i].lower <= eValue {
+			e = i
+			break
+		}
 	}
 
 	res := make([][]byte, 0, count)
-	for cur := sValue + step; cur <= eValue-step; cur += step {
-		curBytes := make([]byte, offset+8)
-		copy(curBytes, start[:offset])
-		binary.BigEndian.PutUint64(curBytes[offset:], cur)
-		res = append(res, curBytes)
+	// if offset>=8, then all values in the histogram are same
+	if offset>=8 ||  s < 0 || e < 0 || s >= e {
+		copy(startBytes, start[:offset])
+		copy(endBytes, end[:offset])
+		sValue := binary.BigEndian.Uint64(startBytes)
+		eValue := binary.BigEndian.Uint64(endBytes)
+
+		step := (eValue - sValue) / uint64(count)
+		if step == uint64(0) {
+			step = uint64(1)
+		}
+
+		for cur := sValue + step; cur <= eValue-step; cur += step {
+			curBytes := make([]byte, 8)
+			binary.BigEndian.PutUint64(curBytes, cur)
+			res = append(res, curBytes)
+		}
+		res = append(res, end)
+	} else {
+		countStart := 0
+		if s > 0 {
+			countStart = hg.buckets[s-1].count
+		}
+
+		total := buckets[e].count - countStart
+		avg := float64(total) / float64(count)
+
+		curIdx := s
+		curCount := float64(0)
+		lastValue := uint64(0)
+		for curIdx <= e {
+			b := &buckets[curIdx]
+			if curCount + float64(buckets[curIdx].count) >= avg {
+				var value uint64
+				if curCount >= avg {
+					value = b.lower
+					curCount = 0
+				} else {
+					delta := (avg - curCount) / float64(b.count) * float64(b.upper - b.lower + 1)
+					value = b.lower + uint64(delta)
+					curCount = float64(buckets[curIdx].count) - delta
+				}
+				if value == lastValue {
+					value += 1
+				}
+				curBytes := make([]byte, 8)
+				binary.BigEndian.PutUint64(curBytes, value)
+				res = append(res, curBytes)
+				lastValue = value
+
+			} else {
+				curCount += float64(buckets[curIdx].count)
+			}
+			curIdx += 1
+		}
+		if len(res) >= int(count) {
+			res[len(res)-1] = end
+		} else {
+			res = append(res, end)
+		}
 	}
-	res = append(res, end)
 
 	return res
 }
