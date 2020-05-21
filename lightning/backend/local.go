@@ -18,6 +18,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
+	"github.com/pingcap/tidb/util/fastrand"
 	"os"
 	"path"
 	"sync"
@@ -810,7 +811,8 @@ func (local *local) WriteRows(
 	rows Rows,
 ) (finalErr error) {
 	kvs := rows.(kvPairs)
-	if len(kvs) == 0 {
+	kvsLen := len(kvs)
+	if kvsLen == 0 {
 		return nil
 	}
 
@@ -820,7 +822,7 @@ func (local *local) WriteRows(
 	}
 	engineFile := e.(*localFile)
 
-	sb := NewSampleBuilder(batchSampleSize)
+	sb := NewSampleBuilder(100)
  	var extractFunc func(b []byte) uint64
 	if tablecodec.IsIndexKey(kvs[0].Key) {
 		extractFunc = func(b []byte) uint64 {
@@ -828,9 +830,9 @@ func (local *local) WriteRows(
 			if len(valueBytes) >= 8 {
 				return binary.BigEndian.Uint64(valueBytes[:8])
 			} else {
-				buf := make([]byte, 0, 8)
-				copy(buf, valueBytes)
-				return binary.BigEndian.Uint64(buf)
+				var buf [8]byte
+				copy(buf[:8], valueBytes)
+				return binary.BigEndian.Uint64(buf[:8])
 			}
 		}
 	} else {
@@ -849,7 +851,9 @@ func (local *local) WriteRows(
 	for _, pair := range kvs {
 		wb.Set(pair.Key, pair.Val, wo)
 		size += int64(len(pair.Key) + len(pair.Val))
-		sb.Add(extractFunc(pair.Key))
+		if fastrand.Uint32N(uint32(kvsLen)) < 100 {
+			sb.Add(extractFunc(pair.Key))
+		}
 	}
 	err := wb.Commit(wo)
 	if err != nil {
