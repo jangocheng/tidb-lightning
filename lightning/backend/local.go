@@ -72,9 +72,10 @@ type localFile struct {
 	startKey []byte
 	endKey   []byte
 
-	sampleChan chan *SampleBuilder
+	sampleChan    chan *SampleBuilder
 	sampleBuilder *SampleBuilder
-	sampleWg sync.WaitGroup
+	histogram     *Histogram
+	sampleWg      sync.WaitGroup
 }
 
 func (e *localFile) Close() error {
@@ -455,8 +456,12 @@ func (local *local) ReadAndSplitIntoRange(engineFile *localFile, engineUUID uuid
 
 	// split data into n ranges, then seek n times to get n + 1 ranges
 	n := engineFile.totalSize / local.regionSplitSize
-	hg := engineFile.sampleBuilder.Build(int(n))
-	engineFile.sampleBuilder = nil
+	hg := engineFile.histogram
+	if hg == nil {
+		engineFile.histogram = engineFile.sampleBuilder.Build(int(n))
+		engineFile.sampleBuilder = nil
+		hg = engineFile.histogram
+	}
 
 	if tablecodec.IsIndexKey(startKey) {
 		// index engine
