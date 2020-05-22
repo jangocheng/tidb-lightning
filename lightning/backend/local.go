@@ -18,7 +18,8 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
-	"github.com/pingcap/tidb/util/fastrand"
+	"fmt"
+	"math/rand"
 	"os"
 	"path"
 	"sync"
@@ -458,8 +459,10 @@ func (local *local) ReadAndSplitIntoRange(engineFile *localFile, engineUUID uuid
 	// split data into n ranges, then seek n times to get n + 1 ranges
 	n := engineFile.totalSize / local.regionSplitSize
 	hg := engineFile.histogram
+	sampleCount := 0
 	if hg == nil {
-		engineFile.histogram = engineFile.sampleBuilder.Build(int(n))
+		sampleCount = int(engineFile.sampleBuilder.count)
+		engineFile.histogram = engineFile.sampleBuilder.Build(int(n) * 2)
 		engineFile.sampleBuilder = nil
 		hg = engineFile.histogram
 	}
@@ -519,7 +522,11 @@ func (local *local) ReadAndSplitIntoRange(engineFile *localFile, engineUUID uuid
 				zap.Binary("start", startKeyOfIndex), zap.Binary("end", lastKeyOfIndex))
 
 
-			values := splitValuesToRange(startValues, endValues, indexRangeCount, hg)
+			values := splitValuesToRange(startValues, endValues, int(indexRangeCount), &Histogram{})
+
+			log.L().Info("split range result", zap.Int64("index", i), zap.Binary("start", startKey),
+				zap.Binary("end", endKey), zap.Int("ranges", len(values)), zap.Int64("rangeCount", indexRangeCount),
+				zap.Int("buckets", len(hg.buckets)), zap.Int("sample", sampleCount))
 
 			keyPrefix := tablecodec.EncodeTableIndexPrefix(tableID, i)
 			for _, v := range values {
@@ -545,10 +552,11 @@ func (local *local) ReadAndSplitIntoRange(engineFile *localFile, engineUUID uuid
 		binary.BigEndian.PutUint64(startBytes, uint64(startHandle))
 		endBytes := make([]byte, 8)
 		binary.BigEndian.PutUint64(endBytes, uint64(endHandle))
-		values := splitValuesToRange(startBytes, endBytes, n, hg)
+		values := splitValuesToRange(startBytes, endBytes, int(n), hg)
 
 		log.L().Info("data engine", zap.Int64("step", step),
-			zap.Int64("startHandle", startHandle), zap.Int64("endHandle", endHandle))
+			zap.Int64("startHandle", startHandle), zap.Int64("endHandle", endHandle),
+			zap.Int("range", len(values)), zap.Int("buckets", len(hg.buckets)), zap.Int("sample", sampleCount))
 
 		start := startHandle
 		for i, endBytes := range values {
@@ -816,6 +824,8 @@ func (local *local) WriteRows(
 		return nil
 	}
 
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+
 	e, ok := local.engines.Load(engineUUID)
 	if !ok {
 		return errors.Errorf("could not find engine for %s", engineUUID.String())
@@ -851,10 +861,12 @@ func (local *local) WriteRows(
 	for _, pair := range kvs {
 		wb.Set(pair.Key, pair.Val, wo)
 		size += int64(len(pair.Key) + len(pair.Val))
-		if fastrand.Uint32N(uint32(kvsLen)) < 100 {
+		v := r.Int31n(int32(kvsLen))
+		if v < 100 {
 			sb.Add(extractFunc(pair.Key))
 		}
 	}
+	fmt.Printf("batch size: %d, count: %d\n", kvsLen, sb.count)
 	err := wb.Commit(wo)
 	if err != nil {
 		return err
@@ -940,12 +952,12 @@ func nextKey(key []byte) []byte {
 // splitValuesToRange try to cut [start, end] to count range approximately
 // just like [start, v1], [v1, v2]... [vCount, end]
 // return value []{v1, v2... vCount}
-func splitValuesToRange(start []byte, end []byte, count int64, hg *Histogram) [][]byte {
+func splitValuesToRange(start []byte, end []byte, count int, hg *Histogram) [][]byte {
 	if bytes.Compare(start, end) == 0 {
 		log.L().Info("couldn't split range due to start end are same",
 			zap.Binary("start", start),
 			zap.Binary("end", end),
-			zap.Int64("count", count))
+			zap.Int("count", count))
 		return [][]byte{end}
 	}
 
@@ -987,7 +999,7 @@ func splitValuesToRange(start []byte, end []byte, count int64, hg *Histogram) []
 
 	res := make([][]byte, 0, count)
 	// if offset>=8, then all values in the histogram are same
-	if offset>=8 ||  s < 0 || e < 0 || s >= e {
+	if offset>=8 ||  s < 0 || e < 0 || e - s < count {
 		copy(startBytes, start[:offset])
 		copy(endBytes, end[:offset])
 		sValue := binary.BigEndian.Uint64(startBytes)
@@ -1010,42 +1022,33 @@ func splitValuesToRange(start []byte, end []byte, count int64, hg *Histogram) []
 			countStart = hg.buckets[s-1].count
 		}
 
+		adjestedBounds := make([]float64, len(buckets))
+		lastCount := 0
+		for i, b := range buckets[:len(buckets)-1] {
+			curCount := b.count - lastCount
+			nextCount := buckets[i+1].count - curCount
+			adjestedBounds[i] = float64(b.upper) + float64(buckets[i+1].lower - b.upper) / float64(curCount + nextCount) * float64(curCount)
+		}
+
+		fmt.Printf("adjestBound: %v\n", adjestedBounds)
+
 		total := buckets[e].count - countStart
 		avg := float64(total) / float64(count)
 
 		curIdx := s
-		curCount := float64(0)
-		lastValue := uint64(0)
-		for curIdx <= e {
+		curThreshold := avg
+		for curIdx < e {
 			b := &buckets[curIdx]
-			if curCount + float64(buckets[curIdx].count) >= avg {
-				var value uint64
-				if curCount >= avg {
-					value = b.lower
-					curCount = 0
-				} else {
-					delta := (avg - curCount) / float64(b.count) * float64(b.upper - b.lower + 1)
-					value = b.lower + uint64(delta)
-					curCount = float64(buckets[curIdx].count) - delta
-				}
-				if value == lastValue {
-					value += 1
-				}
+			if float64(b.count) >= curThreshold {
+				value := uint64(adjestedBounds[curIdx])
 				curBytes := make([]byte, 8)
 				binary.BigEndian.PutUint64(curBytes, value)
 				res = append(res, curBytes)
-				lastValue = value
-
-			} else {
-				curCount += float64(buckets[curIdx].count)
+				curThreshold += avg
 			}
 			curIdx += 1
 		}
-		if len(res) >= int(count) {
-			res[len(res)-1] = end
-		} else {
-			res = append(res, end)
-		}
+		res = append(res, end)
 	}
 
 	return res
