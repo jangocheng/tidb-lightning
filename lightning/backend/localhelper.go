@@ -27,10 +27,12 @@ const SplitRetryTimes = 32
 
 func (local *local) SplitAndScatterRegionByRanges(ctx context.Context, ranges []Range) error {
 	if len(ranges) == 0 {
-		// TODO log
+		log.L().Warn("split and scatter: range is empty!")
 
 		return nil
 	}
+
+	start := time.Now()
 
 	minKey := codec.EncodeBytes([]byte{}, ranges[0].start)
 	maxKey := codec.EncodeBytes([]byte{}, ranges[len(ranges)-1].end)
@@ -77,6 +79,9 @@ SplitRegions:
 		}
 		break
 	}
+
+	log.L().Info("batch split region", zap.Int("ranges", len(splitKeyMap)),
+		zap.Int("regions", len(scatterRegions)), zap.Duration("take", time.Since(start)))
 
 	startTime := time.Now()
 	scatterCount := 0
