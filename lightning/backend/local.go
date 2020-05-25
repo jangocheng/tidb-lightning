@@ -22,6 +22,7 @@ import (
 	"math/rand"
 	"os"
 	"path"
+	"sort"
 	"sync"
 	"time"
 
@@ -619,9 +620,7 @@ func (local *local) writeAndIngestByRange(
 	}
 
 	var regions []*split.RegionInfo
-	var metas []*sst.SSTMeta
 	var err error
-
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 WriteAndIngest:
@@ -637,20 +636,17 @@ WriteAndIngest:
 			continue WriteAndIngest
 		}
 
+		shouldWait := false
+		errChan := make(chan error)
 		startIndex := 0
 		for _, region := range regions {
 			regionEnd := region.Region.EndKey
-			endIndex := binarySearch(pairs, regionEnd)
-			if endIndex != -1 {
-				endKey = codec.EncodeBytes([]byte{}, pairs[endIndex].Key)
-				// endKey should write into tikv in this region
-				endIndex++
-			} else {
-				// This shouldn't happen
-				log.L().Error("[shouldn't happen] didn't find last key that less than region end", zap.Binary("regionEnd", regionEnd))
-				endKey = codec.EncodeBytes([]byte{}, pairs[len(pairs)-1].Key)
-				endIndex = len(pairs) - 1
-			}
+			_, endKey, _ := codec.DecodeBytes(region.Region.EndKey, []byte{})
+			endIndex := sort.Search(len(pairs), func(i int) bool {
+				return bytes.Compare(pairs[i].Key, endKey) >= 0
+			})
+
+			endKey = codec.EncodeBytes([]byte{}, pairs[endIndex-1].Key)
 
 			log.L().Debug("get region", zap.Int("retry", retry), zap.Binary("startKey", startKey),
 				zap.Binary("endKey", endKey), zap.Uint64("id", region.Region.GetId()),
@@ -672,49 +668,81 @@ WriteAndIngest:
 					zap.Reflect("meta", meta), zap.Reflect("region", region))
 				continue WriteAndIngest
 			}
-			metas, err = local.WriteToTiKV(ctx, meta, ts, region, pairs[startIndex:endIndex])
-			if err != nil {
-				log.L().Warn("write to tikv failed", zap.Error(err))
-				continue WriteAndIngest
-			}
 
-			var resp *sst.IngestResponse
-		IngestMeta:
-			for _, meta := range metas {
-				for i := 0; i < maxRetryTimes; i++ {
-					log.L().Debug("ingest meta", zap.Reflect("meta", meta))
-					resp, err = local.Ingest(ctx, meta, region)
-					if err != nil {
-						log.L().Warn("ingest failed", zap.Error(err))
-						continue
-					}
-					needRetry, newRegion, errIngest := isIngestRetryable(resp, region, meta)
-					if errIngest == nil {
-						// ingest next meta
-						continue IngestMeta
-					}
-					if !needRetry {
-						// met non-retryable error retry whole Write procedure
-						continue WriteAndIngest
-					}
-
-					err = errIngest
-					// retry with not leader and epoch not match error
-					if newRegion != nil {
-						region = newRegion
-					} else {
-						log.L().Warn("retry ingest due to",
-							zap.Reflect("meta", meta), zap.Reflect("region", region),
-							zap.Reflect("new region", newRegion), zap.Error(errIngest))
-						continue WriteAndIngest
-					}
+			if len(regions) == 1 {
+				if err := local.WriteAndIngestPairs(ctx, meta, ts, region, pairs[startIndex:endIndex]); err != nil {
+					continue WriteAndIngest
 				}
+			} else {
+				shouldWait = true
+				go func() {
+					errChan <- local.WriteAndIngestPairs(ctx, meta, ts, region, pairs[startIndex:endIndex])
+				}()
 			}
+
 			startKey = regionEnd
 			startIndex = endIndex
 		}
+		if shouldWait {
+			shouldRetry := false
+			for i := 0; i < len(regions); i++ {
+				err = <- errChan
+				if err != nil {
+					shouldRetry = true
+				}
+			}
+			if !shouldRetry {
+				return nil
+			}
+		}
 	}
 	return err
+}
+
+func (local *local) WriteAndIngestPairs(
+	ctx context.Context,
+	meta *sst.SSTMeta,
+	ts uint64,
+	region *split.RegionInfo,
+	pairs []*sst.Pair,
+) error {
+	metas, err := local.WriteToTiKV(ctx, meta, ts, region, pairs)
+	if err != nil {
+		log.L().Warn("write to tikv failed", zap.Error(err))
+		return err
+	}
+
+	for _, meta := range metas {
+		for i := 0; i < maxRetryTimes; i++ {
+			log.L().Debug("ingest meta", zap.Reflect("meta", meta))
+			resp, err := local.Ingest(ctx, meta, region)
+			if err != nil {
+				log.L().Warn("ingest failed", zap.Error(err))
+				continue
+			}
+			needRetry, newRegion, errIngest := isIngestRetryable(resp, region, meta)
+			if errIngest == nil {
+				// ingest next meta
+				break
+			}
+			if !needRetry {
+				// met non-retryable error retry whole Write procedure
+				return errIngest
+			}
+
+			err = errIngest
+			// retry with not leader and epoch not match error
+			if newRegion != nil {
+				region = newRegion
+			} else {
+				log.L().Warn("retry ingest due to",
+					zap.Reflect("meta", meta), zap.Reflect("region", region),
+					zap.Reflect("new region", newRegion), zap.Error(errIngest))
+				return errIngest
+			}
+		}
+	}
+	return nil
 }
 
 func (local *local) WriteAndIngestByRanges(ctx context.Context, engineFile *localFile, ranges []Range) error {
