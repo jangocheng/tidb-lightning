@@ -1039,7 +1039,12 @@ func (t *TableRestore) postProcess(ctx context.Context, rc *RestoreController, c
 	// 3. alter table set auto_increment
 	if cp.Status < CheckpointStatusAlteredAutoInc {
 		rc.alterTableLock.Lock()
-		err := AlterAutoIncrement(ctx, rc.tidbMgr.db, t.tableName, t.alloc[0].Base()+1)
+		var err error
+		if t.tableInfo.Core.PKIsHandle && t.tableInfo.Core.ContainsAutoRandomBits() {
+			err = AlterAutoRandom(ctx, rc.tidbMgr.db, t.tableName, t.alloc[2].Base()+1)
+		} else {
+			err = AlterAutoIncrement(ctx, rc.tidbMgr.db, t.tableName, t.alloc[0].Base()+1)
+		}
 		rc.alterTableLock.Unlock()
 		rc.saveStatusCheckpoint(t.tableName, WholeTableEngineID, err, CheckpointStatusAlteredAutoInc)
 		if err != nil {
